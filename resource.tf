@@ -33,6 +33,11 @@ resource "aws_internet_gateway" "main" {
   vpc_id = aws_vpc.main.id
 }
 
+# Fetch available availability zones in the region
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
 # Create two subnets in different Availability Zones
 resource "aws_subnet" "subnet_a" {
   vpc_id     = aws_vpc.main.id
@@ -117,18 +122,13 @@ module "group2" {
   }
 }
 
-# Fetch available availability zones in the region
-data "aws_availability_zones" "available" {
-  state = "available"
-}
-
 # Create Application Load Balancer (ALB)
 resource "aws_lb" "web" {
   name               = "${var.prefix}-web-lb"
   internal           = false
   load_balancer_type = "application"
   security_groups    = [module.group2.security_group_id["web"]]
-  subnets            = [aws_subnet.subnet_a.id, aws_subnet.subnet_b.id]  # Two subnets in different AZs
+  subnets            = [aws_subnet.subnet_a.id, aws_subnet.subnet_b.id]
 
   tags = {
     Name = "${var.prefix}-alb"
@@ -156,44 +156,54 @@ resource "aws_lb_target_group" "web" {
   }
 }
 
-# Attach EC2 Instances to Target Group
-resource "aws_lb_target_group_attachment" "server" {
-  for_each = aws_instance.server
-  target_group_arn = aws_lb_target_group.web.arn
-  target_id        = each.value.id
-  port             = 80
+## Auto Scaling Launch Template
+resource "aws_launch_template" "server" {
+  name_prefix   = "${var.prefix}-lt"
+  image_id      = "ami-066784287e358dad1"
+  instance_type = "t2.micro"
+  key_name      = aws_key_pair.deployer.key_name
+
+  network_interfaces {
+    associate_public_ip_address = true
+    security_groups             = [module.group2.security_group_id["web"]]
+    subnet_id                   = aws_subnet.subnet_a.id
+  }
+
+  # Encode the user data as base64
+  user_data = base64encode(<<-EOF
+              #!/bin/bash
+              sudo yum update -y
+              sudo yum install -y httpd
+              sudo systemctl start httpd.service
+              sudo systemctl enable httpd.service
+              echo "<h1>Hello World from ${var.prefix}</h1>" | sudo tee /var/www/html/index.html
+              sudo systemctl restart httpd.service
+  EOF
+  )
 }
 
-# Create EC2 Instances
-resource "aws_instance" "server" {
-  for_each               = toset(local.instance_names)
-  ami                    = "ami-066784287e358dad1"
-  instance_type          = "t2.micro"
-  key_name               = aws_key_pair.deployer.key_name
-  subnet_id              = aws_subnet.subnet_a.id  # Placing in Subnet A
-  vpc_security_group_ids = [module.group2.security_group_id["web"]]
-  associate_public_ip_address = true  # Ensure public IP is assigned
-  user_data = <<-EOF
-                     #!/bin/bash
-                     sudo yum update -y
-                     sudo yum install -y httpd
-                     sudo systemctl start httpd.service
-                     sudo systemctl enable httpd.service
-                     echo "<h1>Hello World from ${var.prefix}</h1>" | sudo tee /var/www/html/index.html
-                     sudo systemctl restart httpd.service  # Restart to ensure it starts properly
-  EOF
 
-  tags = {
-    Name = each.key
+# Auto Scaling Group
+resource "aws_autoscaling_group" "server" {
+  desired_capacity     = var.instance_count
+  max_size             = var.instance_count
+  min_size             = 1
+  vpc_zone_identifier  = [aws_subnet.subnet_a.id, aws_subnet.subnet_b.id]
+  launch_template {
+    id      = aws_launch_template.server.id
+    version = "$Latest"
+  }
+
+  target_group_arns = [aws_lb_target_group.web.arn]
+
+  tag {
+    key                 = "Name"
+    value               = "${var.prefix}-asg"
+    propagate_at_launch = true
   }
 }
 
 # Output the Load Balancer DNS Name
 output "load_balancer_dns_name" {
   value = aws_lb.web.dns_name
-}
-
-# Output the EC2 Instances Public IPs (for debugging)
-output "ec2_public_ips" {
-  value = [for instance in aws_instance.server : instance.public_ip]
 }
